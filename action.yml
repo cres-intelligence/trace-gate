@@ -1,0 +1,92 @@
+name: Parkour-AI Trace release gate
+description: Fails the job unless Parkour-AI Trace says the release may go -- every item approved, the trace chain complete, every test passed at this commit.
+branding:
+  icon: shield
+  color: blue
+inputs:
+  release:
+    description: The release, which is the Jira fix version (for example 2.4.0).
+    required: true
+  token:
+    description: A Trace gate token for the project. Store it as a secret.
+    required: true
+  commit:
+    description: The commit to judge test results at. Defaults to the commit being built.
+    required: false
+    default: ${{ github.sha }}
+  results:
+    description: Optional path to a JUnit XML report to post before asking the gate.
+    required: false
+  results-token:
+    description: A Trace results token, required when `results` is given.
+    required: false
+  sbom:
+    description: Optional path to a CycloneDX or SPDX bill of materials to post before asking the gate.
+    required: false
+  sbom-token:
+    description: A Trace SBOM token, required when `sbom` is given.
+    required: false
+  api:
+    description: The Trace API.
+    required: false
+    default: https://api.trace.cres-intelligence.io/t12/v1
+runs:
+  using: composite
+  steps:
+    - name: Post test results
+      if: ${{ inputs.results != '' }}
+      shell: bash
+      env:
+        TRACE_API: ${{ inputs.api }}
+        TRACE_RESULTS_TOKEN: ${{ inputs.results-token }}
+        TRACE_COMMIT: ${{ inputs.commit }}
+        TRACE_RELEASE: ${{ inputs.release }}
+        TRACE_REPORT: ${{ inputs.results }}
+      run: |
+        set -euo pipefail
+        query=$(python3 -c 'import sys, urllib.parse as u; print(u.urlencode({"commit": sys.argv[1], "version": sys.argv[2]}))' "$TRACE_COMMIT" "$TRACE_RELEASE")
+        status=$(curl -sS -o /tmp/trace-results.json -w '%{http_code}' -X POST \
+          "$TRACE_API/trace_build_results?$query" \
+          -H "X-Trace-Token: $TRACE_RESULTS_TOKEN" -H 'Content-Type: application/xml' --data-binary "@$TRACE_REPORT")
+        cat /tmp/trace-results.json; echo
+        [ "$status" = "200" ] || { echo "::error::Trace refused the results (HTTP $status)"; exit 1; }
+        python3 -c "import json;d=json.load(open('/tmp/trace-results.json'));u=d.get('Unmapped') or [];print(f\"{d.get('Recorded')} recorded; {len(u)} unmapped\");[print(f'::warning::Unmapped test case (no Jira key): {n}') for n in u]"
+    - name: Post the bill of materials
+      if: ${{ inputs.sbom != '' }}
+      shell: bash
+      env:
+        TRACE_API: ${{ inputs.api }}
+        TRACE_SBOM_TOKEN: ${{ inputs.sbom-token }}
+        TRACE_COMMIT: ${{ inputs.commit }}
+        TRACE_RELEASE: ${{ inputs.release }}
+        TRACE_BILL: ${{ inputs.sbom }}
+      run: |
+        set -euo pipefail
+        query=$(python3 -c 'import sys, os, urllib.parse as u; print(u.urlencode({"release": sys.argv[1], "commit": sys.argv[2], "filename": os.path.basename(sys.argv[3])}))' "$TRACE_RELEASE" "$TRACE_COMMIT" "$TRACE_BILL")
+        status=$(curl -sS -o /tmp/trace-sbom.json -w '%{http_code}' -X POST "$TRACE_API/trace_build_sbom?$query" \
+          -H "X-Trace-Token: $TRACE_SBOM_TOKEN" -H 'Content-Type: application/json' --data-binary "@$TRACE_BILL")
+        cat /tmp/trace-sbom.json; echo
+        [ "$status" = "200" ] || { echo "::error::Trace refused the bill of materials (HTTP $status)"; exit 1; }
+    - name: Ask the release gate
+      shell: bash
+      env:
+        TRACE_API: ${{ inputs.api }}
+        TRACE_GATE_TOKEN: ${{ inputs.token }}
+        TRACE_COMMIT: ${{ inputs.commit }}
+        TRACE_RELEASE: ${{ inputs.release }}
+      run: |
+        set -euo pipefail
+        status=$(curl -sS -o /tmp/trace-gate.json -w '%{http_code}' -G "$TRACE_API/trace_build_gate" \
+          --data-urlencode "release=$TRACE_RELEASE" --data-urlencode "commit=$TRACE_COMMIT" -H "X-Trace-Token: $TRACE_GATE_TOKEN")
+        [ "$status" = "200" ] || { cat /tmp/trace-gate.json; echo; echo "::error::Trace could not judge the release (HTTP $status)"; exit 1; }
+        python3 - <<'PY'
+        import json, sys
+        d = json.load(open('/tmp/trace-gate.json'))
+        if d.get('Allowed'):
+            print(f"Release {d['Release']} may go at {str(d.get('Commit'))[:7]} ({d.get('Items')} items judged).")
+            sys.exit(0)
+        print(f"Release {d['Release']} refused at {str(d.get('Commit'))[:7]}:")
+        for m in d.get('Missing') or []:
+            print(f"::error::{(m.get('item') or '').strip()} {m.get('says')}".replace('::error:: ', '::error::'))
+        sys.exit(1)
+        PY
